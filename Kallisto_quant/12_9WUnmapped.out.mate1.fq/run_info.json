@@ -1,0 +1,9 @@
+{
+	"n_targets": 83803,
+	"n_bootstraps": 50,
+	"n_processed": 51346511,
+	"kallisto_version": "0.43.1",
+	"index_version": 10,
+	"start_time": "Sat May 25 01:28:50 2019",
+	"call": "kallisto quant -i /data/biorefs/reference_genomes/ensembl-release-96/danio_rerio/kallisto/Danio_rerio.GRCz11.96.cdna.primary_assembly.with_unspliced_genes.idx -o /fast/users/a1211024/sorl1_W1818X_6month/07_kallisto_quant/12_9WUnmapped.out.mate1.fq -t 16 --rf-stranded -b 50 12_9WUnmapped.out.mate1.fq 12_9WUnmapped.out.mate2.fq"
+}
