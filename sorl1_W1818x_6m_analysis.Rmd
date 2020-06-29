@@ -1,0 +1,644 @@
+---
+title: "sorl1 W1818* 6m analysis"
+author: "Karissa Barthelson"
+date: "15/05/2020"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo = T, message=FALSE}
+# Set workspace -------------------------------------------------
+library(magrittr)
+library(reshape2)
+library(tidyverse)
+library(readxl)
+
+# Analysis with bioconductor
+library(limma)
+library(edgeR)
+library(biomaRt)
+library(qvalue)
+library(AnnotationHub)
+library(GenomicRanges)
+library(rtracklayer)
+library(fgsea)
+library(RUVSeq)
+library(ngsReports)
+library(metap)
+
+
+# Visualisation
+library(RColorBrewer)
+library(grid)
+library(gridExtra)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(pheatmap)
+library(ggrepel)
+library(ggeasy)
+library(pathview)
+library(VennDiagram)
+library(UpSetR)
+library(pander)
+library(ggfortify)
+
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Viewports for grid
+vp_left <- viewport(x = 0, y = 0, width = 0.5, height = 1, just = c(0, 0))
+vp_right <- viewport(x = 0.5, y = 0, width = 0.5, height = 1, just = c(0,0))
+```
+
+# Introduction
+
+Here, I am determining whether heterozygosity for the W1818* mutation in *sorl1* causes a change in the brain transcriptome. I prepared a family of fish arising from a *sorl1<sup>W1818\*/+*</sup>* x *sorl1<sup>+/+*</sup> pair mating. When this family was 6 months of age, I sacrificed 20 fish (equal males and females) and genotyped them using PCR. I then chose 6 males and 6 females, each containing 3 of each genotype for RNA extraction, library preparation and RNA-sequencing (library prep and sequencing performed by *Novogene*). 
+
+Prior to this analysis, the provided reads (already trimmed of adaptors) were pseudo aligned to the zebrafish transcriptome using kallisto (v??) Settings were assigned as --rf-stranded  and 50 bootstraps. The index file for kallisto used the .gtf file of the GRCz11 (release 96) build of the zebrafish genome from the ENSEMBL database, with sequences for unspliced transcripts additionally included. 
+
+## Metadata of fish
+
+```{r meta}
+metadata <- read_excel("ext_data/metadata.xlsx") %>%
+  dplyr::select("Fish", "Sex", "Genotype", "SampleName", "Group", "Lane_in_sequencing", "short_sample_name") %>%
+  set_colnames(c("Fish", "Sex", "Genotype", "SampleName", "Full_sample_Info", "Lane_in_sequencing", "short_sample_name")) %>%
+  dplyr::filter(!is.na(SampleName)) %>%
+  mutate(Sex = factor(Sex, levels = c("F", "M")),
+         Genotype = factor(Genotype, levels = c("WT", "mut")),
+         short_sample_name = paste0("samp_", short_sample_name))
+
+metadata %>% 
+  dplyr::select(-c(SampleName, Full_sample_Info, short_sample_name)) %>% 
+  kable(caption = "Summary of fish metadata") %>% 
+  kable_styling(latex_options = 'basic', full_width = F)
+
+```
+## annotations
+
+```{r}
+gr <- import.gff("ftp://ftp.ensembl.org/pub/release-96/gtf/danio_rerio/Danio_rerio.GRCz11.96.gtf.gz")
+
+# Make a Transcript to gene mapping file
+tr2gn <- gr %>% 
+  subset(!is.na(transcript_id)) %>% #remove data points without a transcript id
+  subset(type == "transcript") %>%
+  mcols() %>%
+  as.data.frame() %>%
+  dplyr::select(gene_id, transcript_id) %>%
+  as_tibble()
+
+# also need GC content and length
+
+ah <- AnnotationHub() %>%
+  subset(species == "Danio rerio") %>%
+  subset(rdataclass == "EnsDb")
+
+ensDb <- ah[["AH74989"]]
+
+grTrans <- transcripts(ensDb)
+
+trLengths <- exonsBy(ensDb, "tx") %>%
+  width() %>%
+  vapply(sum, integer(1))
+
+mcols(grTrans)$length <- trLengths[names(grTrans)]
+
+gcGene <- grTrans %>%
+  mcols() %>%
+  as.data.frame() %>%
+  dplyr::select(gene_id, tx_id, gc_content, length) %>%
+  as_tibble() %>%
+  group_by(gene_id) %>%
+  summarise(
+    gc_content = sum(gc_content*length) / sum(length),
+    length = ceiling(median(length))
+  )
+grGenes <- genes(ensDb)
+
+mcols(grGenes) %<>%
+  as.data.frame() %>%
+  left_join(gcGene) %>%
+  as.data.frame() %>%
+  DataFrame()
+```
+
+## raw counts (catchkallisto)
+```{r counts}
+counts <- list.files(
+  path = "Kallisto_quant/",
+  full.names = TRUE) %>%
+  catchKallisto()
+
+# tidy up colnames
+colnames(counts$counts) <- colnames(counts$counts) %>%
+  basename() %>%
+  str_replace_all("(.+)Unmapped.out.mate1.fq", "samp_\\1")
+```
+
+## make DGE
+```{r}
+#Now can make the gene DGE object
+geneDGE <- counts$counts %>%
+  as.data.frame() %>%
+  rownames_to_column("transcript_id") %>%
+  dplyr::filter(!grepl("unspliced", transcript_id)) %>%
+  as_tibble() %>%
+  mutate(transcript_id = str_remove_all(transcript_id, "\\.[0-9]+")) %>%
+  gather(key = "Sample", value = "Counts", starts_with("samp")) %>%
+  left_join(tr2gn) %>%
+  group_by(Sample, gene_id) %>%
+  summarise(Counts = sum(Counts)) %>%
+  spread(key = "Sample", value = "Counts") %>%
+  column_to_rownames("gene_id") %>%
+  DGEList(genes = rownames(.)) %>%
+  calcNormFactors()
+
+#Add metadata to samples
+geneDGE$samples %<>% 
+  as.data.frame() %>% 
+  rownames_to_column("short_sample_name") %>% 
+  left_join(metadata)
+
+# Add gene info to $genes
+geneDGE$genes %<>% 
+  set_colnames("gene_id") %>% 
+  left_join(grGenes %>% 
+              as_tibble() %>% 
+              dplyr::select(gene_id, gene_name, gc_content, length,
+                            c(chromosome = seqnames), strand, description)) 
+```
+# Filtering of lowly expressed genes
+
+Genes which are lowly expressed in RNA-seq data are not informative for differential gene expression analysis. Since one count in one RNA-seq library and 3 counts in another library does not necesserily mean a 3 fold change. Therefore we need to filter out any genes which are lowly expressed. The general rule for filtering is having a cpm above 10/(min_lib_size/1000000) in at least half of the RNA-seq libraries. 
+
+```{r filtering_of_lowly_expressed_genes}
+# filtering of lowly expressed transcripts --------------------------------
+
+#First, i need to find the lowest library size
+geneDGE$samples$lib.size %>%
+  sort() %>%
+  comma
+min_lib_size = 13065639
+
+#The formula for deteriming the threshold for filtering:
+10/(min_lib_size/1000000) # = 0.75
+
+keepTheseTranscripts <- (rowSums(cpm(geneDGE) > 0.75) >= 6) 
+
+# Density plots to determine the effects of filtering
+
+#before filtering
+b4FilteringPlot <- geneDGE %>% 
+  cpm(log = TRUE) %>% 
+  melt %>% 
+  dplyr::filter(is.finite(value)) %>% 
+  ggplot(aes(x = value, colour = Var2)) +
+  geom_density() + 
+  guides(colour = FALSE) +
+  ggtitle("Before filtering") +
+  labs(x = "logCPM", y = "Proportion of Genes") 
+
+#after filtering
+geneDGE_filtered <- geneDGE[keepTheseTranscripts,, keep.lib.sizes=FALSE]
+
+afterfilt <-geneDGE_filtered %>% 
+  cpm(log = TRUE) %>% 
+  melt %>% 
+  dplyr::filter(is.finite(value)) %>% 
+  ggplot(aes(x = value, colour = Var2)) +
+  geom_density() + 
+  guides(colour = FALSE) +
+  ggtitle("After filtering") +
+  labs(x = "logCPM", y = "Proportion of Genes") 
+
+grid.newpage()
+print(b4FilteringPlot, vp = vp_left)
+print(afterfilt, vp = vp_right)
+```
+
+Peforming this filtering will leave `r dim(geneDGE_filtered$counts)[1]` out of the `r dim(geneDGE$counts)[1]` in the original dataset.
+
+## library sizes
+
+Library sizes after filterling lowly expressed genes. 
+
+```{r}
+geneDGE_filtered$samples %>% 
+  mutate(`Library size (millions)` = lib.size/1e6) %>% 
+  ggplot(aes(Full_sample_Info , `Library size (millions)`, fill = Genotype)) +
+  geom_col() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  facet_wrap(~Genotype, scales = "free_x") +
+  xlab("sample") +
+  easy_rotate_labels(which = "x", angle = 315) 
+```
+
+# Prinicpal component analysis
+
+We can summarise the overall similarity betweeen samples by principle component analysis (PCA). In PCA, the data (normalised counts) is subject to dimensionality-reduction by transforming the large matrix of genes and samples into a smaller set which still contains most of the information in the large set. These smaller sets are called 'principle components,' and the first prinicple component will explain the majority of the variance observed in the data. If the W1818* mutation in *sorl1* has a large effect on the brain transcriptome, we expect that the samples will seperate along the first principle component when we plot PC1 against PC2 of each sample. However, this is not what we observed as shown below. Two distinct clusters are observed, but it is not explained by genotype nor sex.
+
+```{r}
+pca_raw <- prcomp(t(cpm(geneDGE_filtered$counts, log = TRUE)))
+
+pca_raw %>% 
+   autoplot(
+    data = tibble(short_sample_name = rownames(.$x)) %>%
+      left_join(geneDGE_filtered$samples),
+    colour = "Genotype", 
+    shape = "Sex", 
+    size = 4
+  ) +
+  theme_bw()
+```
+
+# Differential expression test - initial 
+
+Here, I will perform a differential expression testing usig exact tests from the package *edgeR*. From this test, I will determine whether any bias for length or GC content is observed in this dataset.
+
+```{r edegr_initial}
+#need to make the genotype column in the DGE object called group
+geneDGE_filtered$samples <- mutate(geneDGE_filtered$samples, 
+       group = Genotype)
+
+#Make the model matrix on the new genotype group column
+design_ExactTest <- model.matrix(~group, data = geneDGE_filtered$samples)
+
+exact_res <- geneDGE_filtered %>% 
+  estimateDisp(design_ExactTest) %>% 
+  edgeR::exactTest() %>% 
+  topTags(n = Inf) %>% 
+  .$table %>% 
+  mutate(DE = FDR < 0.05) %>% 
+  as_tibble()
+
+exact_res %>% 
+  head(10) %>% 
+  dplyr::select(gene_id, gene_name, logFC, logCPM, PValue, FDR, everything()) %>% 
+  kable(caption = 'Top 10 most DE genes via edgeR exact test') %>% 
+  kable_styling(latex_options = 'basic')
+```
+
+
+```{r edgeR vis}
+#Make a volcano plot
+exact_res %>%  
+  ggplot(aes(logFC, -log10(PValue), colour = DE)) +
+  geom_point(alpha = 0.5, size = 2) +
+  theme(aspect.ratio = 1) +
+  ggtitle('Volcano plot showing any DE genes in 6 month \nold sorl1 W1818* mutant brains') +
+  theme_bw() +
+  scale_color_manual(values = c("grey50", "red")) +
+  geom_label_repel(aes(label = gene_name), 
+                   data = . %>% 
+                     dplyr::filter(DE == T), 
+                   show.legend = FALSE)
+
+## MD plot
+exact_res %>% 
+  ggplot(aes(x = logCPM, y = logFC, colour = DE)) + 
+  geom_point(alpha = 0.5, size = 2) +
+  theme(aspect.ratio = 1) +
+  ggtitle('MD plot') +
+  theme_bw() +
+  scale_color_manual(values = c("grey50", "red")) +
+  geom_label_repel(aes(label = gene_name), 
+                   data = . %>% 
+                     dplyr::filter(DE == T), 
+                   show.legend = FALSE)
+
+exact_res %>% 
+  mutate(rankstat = sign(logFC)*-log10(PValue)) %>% 
+  ggplot(aes(x = length, y = rankstat)) +
+  geom_point(aes(colour = DE)) +
+  ggtitle('rankstat v gene length') +
+  theme_bw() +
+  scale_x_log10() +
+  scale_color_manual(values = c("grey50", "red")) +
+  geom_label_repel(aes(label = gene_name), 
+                   data = . %>% 
+                     dplyr::filter(DE == T), 
+                   show.legend = FALSE) +
+  geom_hline(yintercept = 0) +
+  geom_smooth(se = F)
+
+exact_res %>% 
+  mutate(rankstat = sign(logFC)*-log10(PValue)) %>% 
+  ggplot(aes(x = gc_content, y = rankstat)) +
+  geom_point(aes(colour = DE)) +
+  ggtitle('rankstat v gene GC content') +
+  theme_bw() +
+  scale_color_manual(values = c("grey50", "red")) +
+  geom_label_repel(aes(label = gene_name), 
+                   data = . %>% 
+                     dplyr::filter(DE == T), 
+                   show.legend = FALSE) +
+  geom_hline(yintercept = 0) +
+  geom_smooth(se = F)
+```
+
+Since a GC content and length bias is observed in this dataset, `cqn` normalisation is warrented. `cqn` generates an offset term for each gene to correct for this bias which is compatible with edgeR. 
+
+
+
+
+
+
+
+# perform the cqn normalisation
+```{r}
+cqn_W1818x <- cqn(
+  counts = geneDGE_w1818x$counts,
+  x = geneDGE_w1818x$genes$gc_content,
+  lengths = geneDGE_w1818x$genes$length ,
+  sizeFactors = geneDGE_w1818x$samples$lib.size, 
+  )
+```
+
+##visualise the effects
+```{r}
+genoCols <- c("red", "blue") %>%
+  setNames(levels(geneDGE_w1818x$samples$Genotype))
+
+
+par(mfrow = c(1, 2))
+cqnplot(cqn_W1818x, n = 1, xlab = "GC Content", col = genoCols)
+cqnplot(cqn_W1818x, n = 2, xlab = "Length", col = genoCols)
+legend("bottomright",legend = levels(cqn_W1818x$samples$Genotype), col = genoCols, lty = 1)
+```
+
+# add the offset to geneDGE
+```{r}
+geneDGE_w1818x$offset <- cqn_W1818x$glm.offset
+```
+
+## design matrix
+```{r}
+#design with WT as the intercept
+design_cqn_w1818x <- model.matrix(~Genotype + Sex, data = geneDGE_w1818x$samples) %>% 
+  set_colnames(gsub("Genotype", "", colnames(.)))
+
+```
+
+# PCA
+```{r}
+## PCA
+
+cpm_post_cqn_w1818 <- cqn_W1818x %>%
+  with(y + offset)
+
+pca_post_cqn_w1818 <- cpm_post_cqn_w1818 %>%
+  t() %>%
+  prcomp() 
+
+pcaVars_W1818 <- percent_format(0.1)(summary(pca_post_cqn_w1818)$importance["Proportion of Variance",])
+
+pca_post_cqn_w1818$x %>%
+  as.data.frame() %>%
+  rownames_to_column("sample") %>%
+  left_join(geneDGE_w1818x$samples %>% rownames_to_column("sample")) %>% 
+  mutate(Genotype2 = case_when(
+    Genotype == "mut" ~ "W1818*/+", 
+    Genotype == "WT" ~ "+/+"
+  )) %>% 
+  as_tibble() %>% 
+  ggplot(aes(PC1, PC2, colour = Genotype2, colour = Genotype, shape = Sex)) +
+  geom_point(aes(size = lib.size) )+
+  guides(fill = FALSE) +
+  geom_label_repel(aes(label = sample)) +
+  labs(
+    x = paste0("PC1 (", pcaVars_W1818[["PC1"]], ")"),
+    y = paste0("PC2 (", pcaVars_W1818[["PC2"]], ")"),
+    colour = "Genotype"
+  ) +
+  theme_bw() +
+  ggtitle("after cqn normalisation") + 
+  ggsave("cqn/PCAplot_w1818x.tiff", width = 20,height = 20, units = "cm", dpi = 200)
+```
+
+### PC1 kinda depends on lib size
+```{r}
+pca_post_cqn_w1818$x %>%
+  as.data.frame() %>%
+  rownames_to_column("sample") %>%
+  left_join(geneDGE_w1818x$samples %>% rownames_to_column("sample")) %>% 
+  mutate(Genotype2 = case_when(
+    Genotype == "mut" ~ "W1818*/+", 
+    Genotype == "WT" ~ "+/+"
+  )) %>% 
+  as_tibble() %>% 
+  ggplot(aes(PC1, lib.size)) +
+  geom_point(size = 4, aes(colour = Genotype2, fill = Genotype, shape = Sex)) +
+  geom_smooth(method = "lm") +
+  labs(
+    x = paste0("PC1 (", pcaVars_W1818[["PC1"]], ")"),
+    colour = "Genotype"
+  ) +
+  theme_bw() +
+  ggtitle("after cqn normalisation")
+```
+
+# edgeR with cqn
+```{r}
+fit_w <- geneDGE_w1818x %>% 
+  estimateDisp(design_cqn_w1818x) %>% 
+  glmFit(design_cqn_w1818x)
+
+# call the toptable
+topTables_cqn_W1818 <-
+  glmLRT(fit_w, coef = "mut") %>% 
+    topTags(n = Inf) %>% 
+    .$table %>% 
+    mutate(DE = FDR < 0.05, 
+           coef = "W1818*") %>% 
+    dplyr::select(symbol, logFC, logCPM, PValue, FDR, DE, everything()) %>% 
+  as_tibble()
+
+topTables_cqn_W1818
+
+```
+
+## visualisation
+
+```{r}
+topTables_cqn_W1818 %>% 
+  ggplot(aes(x = logFC, y = -log10(PValue), colour = DE)) +
+  geom_point(alpha = 0.5) +
+  theme_bw() +
+  theme(aspect.ratio = 1) +
+  geom_label_repel(aes(label = symbol), 
+                   data = . %>% dplyr::filter(DE == T), 
+                   show.legend = F) +
+  scale_color_manual(values = c("grey50", "red")) +
+  ggsave("cqn/volcanoPlot_W1818.tiff", width = 10, height = 10, units = "cm", dpi = 200)
+```
+# GSEA
+# KEGG 
+```{r}
+ranks_w1818x <- topTables_cqn_W1818 %>% 
+    mutate(PValue_withsign = sign(logFC) * log10(1/PValue)) %>% 
+    arrange(PValue_withsign) %>% 
+    dplyr::select(c("gene_id", "PValue_withsign")) %>% #only want the Pvalue with sign
+    with(structure(PValue_withsign, names = gene_id)) %>% 
+    rev()
+```
+
+
+```{r}
+fgsea_w1818x <- fgsea(stats = ranks_w1818x, pathways = KEGG, nperm = 1e6) %>% 
+      as_tibble() %>%
+      dplyr::rename(FDR = padj) %>%
+      mutate(padj = p.adjust(pval, "bonferroni")) %>%
+      dplyr::select(pathway, pval, FDR, padj, everything()) %>%
+      arrange(pval) %>%
+      mutate(sig = padj < 0.05)
+```
+
+```{r}
+fry <- cpm_post_cqn_w1818 %>% 
+  fry(
+      index = KEGG,
+      design = design_cqn_w1818x, 
+      contrast = "mut", 
+      sort = "directional"
+    ) %>% 
+    rownames_to_column("pathway") %>% 
+    as_tibble()
+```
+
+```{r}
+camera <- cpm_post_cqn_w1818 %>% 
+  camera(
+    index = KEGG,
+    design = design_cqn_w1818x, 
+    contrast = 'mut', 
+    inter.gene.cor = NA,
+    sort = TRUE
+  ) %>% 
+  rownames_to_column("pathway") %>% 
+  as_tibble()
+```
+
+## harmonic p
+
+```{r}
+
+harmonic_p_w1818_KEGG <- 
+  
+  fry %>% 
+    mutate(fry_p = PValue) %>% 
+    dplyr::select(c(pathway, fry_p)) %>% 
+    left_join(
+      camera %>% 
+        mutate(camera_p = PValue) %>% 
+        dplyr::select(c(pathway, camera_p)), 
+      by = "pathway"
+    ) %>%
+    left_join(fgsea_w1818x %>% 
+                mutate(fgsea_p = pval) %>% 
+                dplyr::select(c(pathway, fgsea_p))
+    ) %>% 
+    nest(p = one_of(c("fry_p", "camera_p", "fgsea_p"))) %>% 
+ mutate(
+      harmonic_p = vapply(p, function(x){
+        x <- unlist(x)
+        x <- x[!is.na(x)]
+        p.hmp(x, L = 3)
+      }, numeric(1))
+    ) %>% 
+  unnest() %>% 
+  mutate(harmonic_p_FDR = p.adjust(harmonic_p, "fdr"), 
+         sig = harmonic_p_FDR < 0.05, 
+         coef = "W1818*/+") %>% 
+  arrange(harmonic_p_FDR) %>% 
+  left_join(KEGG_sizes)
+
+```
+
+
+
+# HALLMARK
+```{r}
+ranks_w1818x <- topTables_cqn_W1818 %>% 
+    mutate(PValue_withsign = sign(logFC) * log10(1/PValue)) %>% 
+    arrange(PValue_withsign) %>% 
+    dplyr::select(c("gene_id", "PValue_withsign")) %>% #only want the Pvalue with sign
+    with(structure(PValue_withsign, names = gene_id)) %>% 
+    rev()
+```
+
+
+```{r}
+fgsea_w1818x_hallmark <- fgsea(stats = ranks_w1818x, pathways = hallmark, nperm = 1e6) %>% 
+      as_tibble() %>%
+      dplyr::rename(FDR = padj) %>%
+      mutate(padj = p.adjust(pval, "bonferroni")) %>%
+      dplyr::select(pathway, pval, FDR, padj, everything()) %>%
+      arrange(pval) %>%
+      mutate(sig = padj < 0.05)
+```
+
+```{r}
+fry_hallmark <- cpm_post_cqn_w1818 %>% 
+  fry(
+      index = hallmark,
+      design = design_cqn_w1818x, 
+      contrast = "mut", 
+      sort = "directional"
+    ) %>% 
+    rownames_to_column("pathway") %>% 
+    as_tibble()
+```
+
+```{r}
+camera_hallmark <- cpm_post_cqn_w1818 %>% 
+  camera(
+    index = hallmark,
+    design = design_cqn_w1818x, 
+    contrast = 'mut', 
+    inter.gene.cor = NA,
+    sort = TRUE
+  ) %>% 
+  rownames_to_column("pathway") %>% 
+  as_tibble()
+```
+
+```{r}
+harmonic_p_w1818_hallmark <- fry_hallmark %>% 
+    mutate(fry_p = PValue) %>% 
+    dplyr::select(c(pathway, fry_p)) %>% 
+    left_join(
+      camera_hallmark %>% 
+        mutate(camera_p = PValue) %>% 
+        dplyr::select(c(pathway, camera_p)), 
+      by = "pathway"
+    ) %>%
+    left_join(fgsea_w1818x_hallmark %>% 
+                mutate(fgsea_p = pval) %>% 
+                dplyr::select(c(pathway, fgsea_p))
+    ) %>% 
+    nest(p = one_of(c("fry_p", "camera_p", "fgsea_p"))) %>% 
+ mutate(
+      harmonic_p = vapply(p, function(x){
+        x <- unlist(x)
+        x <- x[!is.na(x)]
+        p.hmp(x, L = 3)
+      }, numeric(1))
+    ) %>% 
+  unnest() %>% 
+  mutate(harmonic_p_FDR = p.adjust(harmonic_p, "fdr"), 
+         sig = harmonic_p_FDR < 0.05, 
+         coef = "W1818*/+") %>% 
+  arrange(harmonic_p_FDR) %>% 
+  left_join(hallmark_sizes)
+```
+
+
+
+
+
