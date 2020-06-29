@@ -29,6 +29,7 @@ library(fgsea)
 library(RUVSeq)
 library(ngsReports)
 library(metap)
+library(cqn)
 
 
 # Visualisation
@@ -344,143 +345,167 @@ exact_res %>%
 
 Since a GC content and length bias is observed in this dataset, `cqn` normalisation is warrented. `cqn` generates an offset term for each gene to correct for this bias which is compatible with edgeR. 
 
+# cqn
 
-
-
-
-
-
-# perform the cqn normalisation
 ```{r}
-cqn_W1818x <- cqn(
-  counts = geneDGE_w1818x$counts,
-  x = geneDGE_w1818x$genes$gc_content,
-  lengths = geneDGE_w1818x$genes$length ,
-  sizeFactors = geneDGE_w1818x$samples$lib.size, 
+cqn <- cqn(
+  counts = geneDGE_filtered$counts,
+  x = geneDGE_filtered$genes$gc_content,
+  lengths = geneDGE_filtered$genes$length ,
+  sizeFactors = geneDGE_filtered$samples$lib.size, 
   )
 ```
 
-##visualise the effects
+## visualise the effects
+
+Variation is clearly obsered 
 ```{r}
 genoCols <- c("red", "blue") %>%
-  setNames(levels(geneDGE_w1818x$samples$Genotype))
-
+  setNames(levels(geneDGE_filtered$samples$Genotype))
 
 par(mfrow = c(1, 2))
-cqnplot(cqn_W1818x, n = 1, xlab = "GC Content", col = genoCols)
-cqnplot(cqn_W1818x, n = 2, xlab = "Length", col = genoCols)
-legend("bottomright",legend = levels(cqn_W1818x$samples$Genotype), col = genoCols, lty = 1)
+cqnplot(cqn, n = 1, xlab = "GC Content", col = genoCols)
+cqnplot(cqn, n = 2, xlab = "Length", col = genoCols)
+legend("bottomright", legend = unique(geneDGE_filtered$samples$Genotype), col = genoCols, lty = 1)
 ```
 
 # add the offset to geneDGE
 ```{r}
-geneDGE_w1818x$offset <- cqn_W1818x$glm.offset
+geneDGE_filtered$offset <- cqn$glm.offset
 ```
 
 ## design matrix
 ```{r}
 #design with WT as the intercept
-design_cqn_w1818x <- model.matrix(~Genotype + Sex, data = geneDGE_w1818x$samples) %>% 
+design_cqn <- model.matrix(~Genotype, data = geneDGE_filtered$samples) %>% 
   set_colnames(gsub("Genotype", "", colnames(.)))
 
 ```
 
-# PCA
+# PCA post cqn
 ```{r}
 ## PCA
-
-cpm_post_cqn_w1818 <- cqn_W1818x %>%
+logCPM_cqn <- cqn %>%
   with(y + offset)
 
-pca_post_cqn_w1818 <- cpm_post_cqn_w1818 %>%
+pca_post_cqn <- logCPM_cqn %>%
   t() %>%
   prcomp() 
-
-pcaVars_W1818 <- percent_format(0.1)(summary(pca_post_cqn_w1818)$importance["Proportion of Variance",])
-
-pca_post_cqn_w1818$x %>%
-  as.data.frame() %>%
-  rownames_to_column("sample") %>%
-  left_join(geneDGE_w1818x$samples %>% rownames_to_column("sample")) %>% 
-  mutate(Genotype2 = case_when(
-    Genotype == "mut" ~ "W1818*/+", 
-    Genotype == "WT" ~ "+/+"
-  )) %>% 
-  as_tibble() %>% 
-  ggplot(aes(PC1, PC2, colour = Genotype2, colour = Genotype, shape = Sex)) +
-  geom_point(aes(size = lib.size) )+
-  guides(fill = FALSE) +
-  geom_label_repel(aes(label = sample)) +
-  labs(
-    x = paste0("PC1 (", pcaVars_W1818[["PC1"]], ")"),
-    y = paste0("PC2 (", pcaVars_W1818[["PC2"]], ")"),
-    colour = "Genotype"
+   
+pca_post_cqn %>% 
+autoplot(
+    data = tibble(short_sample_name = rownames(.$x)) %>%
+      left_join(geneDGE_filtered$samples),
+    colour = "Genotype", 
+    shape = "Sex", 
+    size = 4
   ) +
-  theme_bw() +
-  ggtitle("after cqn normalisation") + 
-  ggsave("cqn/PCAplot_w1818x.tiff", width = 20,height = 20, units = "cm", dpi = 200)
-```
+  theme_bw()
 
-### PC1 kinda depends on lib size
-```{r}
-pca_post_cqn_w1818$x %>%
-  as.data.frame() %>%
-  rownames_to_column("sample") %>%
-  left_join(geneDGE_w1818x$samples %>% rownames_to_column("sample")) %>% 
-  mutate(Genotype2 = case_when(
-    Genotype == "mut" ~ "W1818*/+", 
-    Genotype == "WT" ~ "+/+"
-  )) %>% 
-  as_tibble() %>% 
-  ggplot(aes(PC1, lib.size)) +
-  geom_point(size = 4, aes(colour = Genotype2, fill = Genotype, shape = Sex)) +
-  geom_smooth(method = "lm") +
-  labs(
-    x = paste0("PC1 (", pcaVars_W1818[["PC1"]], ")"),
-    colour = "Genotype"
-  ) +
-  theme_bw() +
-  ggtitle("after cqn normalisation")
 ```
 
 # edgeR with cqn
 ```{r}
-fit_w <- geneDGE_w1818x %>% 
-  estimateDisp(design_cqn_w1818x) %>% 
-  glmFit(design_cqn_w1818x)
+fit_cqn <- geneDGE_filtered %>% 
+  estimateDisp(design_cqn) %>% 
+  glmFit(design_cqn)
 
 # call the toptable
-topTables_cqn_W1818 <-
-  glmLRT(fit_w, coef = "mut") %>% 
+topTable_cqn <-
+  glmLRT(fit_cqn, coef = "mut") %>% 
     topTags(n = Inf) %>% 
     .$table %>% 
     mutate(DE = FDR < 0.05, 
            coef = "W1818*") %>% 
-    dplyr::select(symbol, logFC, logCPM, PValue, FDR, DE, everything()) %>% 
+    dplyr::select(gene_name, logFC, logCPM, PValue, FDR, DE, everything()) %>% 
   as_tibble()
 
-topTables_cqn_W1818
-
+topTable_cqn %>% 
+  head(10) %>% 
+  kable(caption = "DE genes due to sorl1 W1818* after cqn normalisation") %>% 
+  kable_styling()
 ```
+
+Only 2 DE genes were detected. 
 
 ## visualisation
 
 ```{r}
-topTables_cqn_W1818 %>% 
+topTable_cqn %>% 
   ggplot(aes(x = logFC, y = -log10(PValue), colour = DE)) +
   geom_point(alpha = 0.5) +
   theme_bw() +
   theme(aspect.ratio = 1) +
-  geom_label_repel(aes(label = symbol), 
+  geom_label_repel(aes(label = gene_name), 
                    data = . %>% dplyr::filter(DE == T), 
                    show.legend = F) +
-  scale_color_manual(values = c("grey50", "red")) +
-  ggsave("cqn/volcanoPlot_W1818.tiff", width = 10, height = 10, units = "cm", dpi = 200)
+  scale_color_manual(values = c("grey50", "red"))
 ```
-# GSEA
+
+```{r}
+topTable_cqn %>% 
+  ggplot(aes(x = logCPM, y = logFC, colour = DE)) + 
+  geom_point(alpha = 0.5, size = 2) +
+  theme(aspect.ratio = 1) +
+  ggtitle('MD plot') +
+  theme_bw() +
+  scale_color_manual(values = c("grey50", "red")) +
+  geom_label_repel(aes(label = gene_name), 
+                   data = . %>% 
+                     dplyr::filter(DE == T), 
+                   show.legend = FALSE)
+
+topTable_cqn %>% 
+  mutate(rankstat = sign(logFC)*-log10(PValue)) %>% 
+  ggplot(aes(x = length, y = rankstat)) +
+  geom_point(aes(colour = DE)) +
+  ggtitle('rankstat v gene length') +
+  theme_bw() +
+  scale_x_log10() +
+  scale_color_manual(values = c("grey50", "red")) +
+  geom_label_repel(aes(label = gene_name), 
+                   data = . %>% 
+                     dplyr::filter(DE == T), 
+                   show.legend = FALSE) +
+  geom_hline(yintercept = 0) +
+  geom_smooth(se = F)
+
+topTable_cqn %>% 
+  mutate(rankstat = sign(logFC)*-log10(PValue)) %>% 
+  ggplot(aes(x = gc_content, y = rankstat)) +
+  geom_point(aes(colour = DE)) +
+  ggtitle('rankstat v gene GC content') +
+  theme_bw() +
+  scale_color_manual(values = c("grey50", "red")) +
+  geom_label_repel(aes(label = gene_name), 
+                   data = . %>% 
+                     dplyr::filter(DE == T), 
+                   show.legend = FALSE) +
+  geom_hline(yintercept = 0) +
+  geom_smooth(se = F)
+```
+
+Although `cqn` did not perfectly fix the observed bias, *sorl1* is now detected as a DE gene, which I was expecting since I have shown by qPCR that it is subject to dowregulation due to Nonsesene mediated mRNA decay. Therefore, I will proceed with the analysis. 
+
+# Enrichment testing
+
+Since only 2 DE genes were observed, I will perform GSEA on the entire dataset to determine any changes to pre-defined gene sets as a group. Here, I will look at the KEGG, HALLMARK and IRE gene sets. 
+
+## Define the gene sets
+
+```{r}
+KEGG <- msigdbr("Danio rerio", category = "C2", subcategory = "CP:KEGG") %>%
+	inner_join(ens2Entrez) %>%
+	distinct(gs_name, gene_id, .keep_all = TRUE) %>% 
+  split(f = .$gs_name) %>%
+  lapply(extract2, "gene_id")
+```
+
+
+
 # KEGG 
 ```{r}
-ranks_w1818x <- topTables_cqn_W1818 %>% 
+ranks <- topTable_cqn %>% 
     mutate(PValue_withsign = sign(logFC) * log10(1/PValue)) %>% 
     arrange(PValue_withsign) %>% 
     dplyr::select(c("gene_id", "PValue_withsign")) %>% #only want the Pvalue with sign
@@ -490,7 +515,7 @@ ranks_w1818x <- topTables_cqn_W1818 %>%
 
 
 ```{r}
-fgsea_w1818x <- fgsea(stats = ranks_w1818x, pathways = KEGG, nperm = 1e6) %>% 
+fgsea_res <- fgsea(stats = ranks_, pathways = KEGG, nperm = 1e6) %>% 
       as_tibble() %>%
       dplyr::rename(FDR = padj) %>%
       mutate(padj = p.adjust(pval, "bonferroni")) %>%
