@@ -1,5 +1,5 @@
 ---
-title: "sorl1 W1818* 6m analysis"
+title: "sorl1 W1818* 6m analysis RUV"
 author: "Karissa Barthelson"
 date: "15/05/2020"
 output: 
@@ -313,88 +313,36 @@ exact_res %>%
                    data = . %>% 
                      dplyr::filter(DE == T), 
                    show.legend = FALSE)
-
-exact_res %>% 
-  mutate(rankstat = sign(logFC)*-log10(PValue)) %>% 
-  ggplot(aes(x = length, y = rankstat)) +
-  geom_point(aes(colour = DE)) +
-  ggtitle('rankstat v gene length') +
-  theme_bw() +
-  scale_x_log10() +
-  scale_color_manual(values = c("grey50", "red")) +
-  geom_label_repel(aes(label = gene_name), 
-                   data = . %>% 
-                     dplyr::filter(DE == T), 
-                   show.legend = FALSE) +
-  geom_hline(yintercept = 0) +
-  geom_smooth(se = F)
-
-exact_res %>% 
-  mutate(rankstat = sign(logFC)*-log10(PValue)) %>% 
-  ggplot(aes(x = gc_content, y = rankstat)) +
-  geom_point(aes(colour = DE)) +
-  ggtitle('rankstat v gene GC content') +
-  theme_bw() +
-  scale_color_manual(values = c("grey50", "red")) +
-  geom_label_repel(aes(label = gene_name), 
-                   data = . %>% 
-                     dplyr::filter(DE == T), 
-                   show.legend = FALSE) +
-  geom_hline(yintercept = 0) +
-  geom_smooth(se = F)
 ```
 
-Since a GC content and length bias is observed in this dataset, `cqn` normalisation is warrented. `cqn` generates an offset term for each gene to correct for this bias which is compatible with edgeR. 
+# RUVSeq to remove unwanted variation
 
-# cqn
+To assist with identifying changes to gene expression due to sorl1 genotype, I will perform RUVseq transformation to remove 1 factor of unwanted variation. 
 
 ```{r}
-cqn <- cqn(
-  counts = geneDGE_filtered$counts,
-  x = geneDGE_filtered$genes$gc_content,
-  lengths = geneDGE_filtered$genes$length ,
-  sizeFactors = geneDGE_filtered$samples$lib.size, 
-  )
+#Define the negative control of the 10,000 least DE genes
+RUVneg <- exact_res %>% 
+  as.data.frame %>%
+  dplyr::arrange(desc(PValue)) %>% #sort by PValue
+  .[1:10000,] %>% #Take the top 10,000 with highest P value (i.e. the least DE)
+  .$gene_id
+
+#Apply the RUV method
+RUV <- geneDGE_filtered$counts %>% 
+  round()  %>% 
+  RUVg(RUVneg, 1) #Estimate 1 factor of unwanted variation
 ```
 
-## visualise the effects
+# PCA on RUV adjusted counts
 
-Variation is clearly obsered 
+After RUV-seq, some seperation across PC2 by Genotype is observed. 
+
 ```{r}
-genoCols <- c("red", "blue") %>%
-  setNames(levels(geneDGE_filtered$samples$Genotype))
-
-par(mfrow = c(1, 2))
-cqnplot(cqn, n = 1, xlab = "GC Content", col = genoCols)
-cqnplot(cqn, n = 2, xlab = "Length", col = genoCols)
-legend("bottomright", legend = unique(geneDGE_filtered$samples$Genotype), col = genoCols, lty = 1)
-```
-
-# add the offset to geneDGE
-```{r}
-geneDGE_filtered$offset <- cqn$glm.offset
-```
-
-## design matrix
-```{r}
-#design with WT as the intercept
-design_cqn <- model.matrix(~Genotype, data = geneDGE_filtered$samples) %>% 
-  set_colnames(gsub("Genotype", "", colnames(.)))
-
-```
-
-# PCA post cqn
-```{r}
-## PCA
-logCPM_cqn <- cqn %>%
-  with(y + offset)
-
-pca_post_cqn <- logCPM_cqn %>%
-  t() %>%
-  prcomp() 
-   
-pca_post_cqn %>% 
-autoplot(
+RUV$normalizedCounts %>% 
+  cpm(log=TRUE) %>% 
+  t() %>% 
+  prcomp() %>% 
+  autoplot(
     data = tibble(short_sample_name = rownames(.$x)) %>%
       left_join(geneDGE_filtered$samples),
     colour = "Genotype", 
@@ -402,62 +350,39 @@ autoplot(
     size = 4
   ) +
   theme_bw()
-
-## before and after cqn
-ggarrange(
-  pca_raw %>% 
-autoplot(
-    data = tibble(short_sample_name = rownames(.$x)) %>%
-      left_join(geneDGE_filtered$samples),
-    colour = "Genotype", 
-    shape = "Sex", 
-    size = 4
-  ) +
-  theme_bw() +
-  ggtitle("Before cqn"), 
-
-pca_post_cqn %>% 
-autoplot(
-    data = tibble(short_sample_name = rownames(.$x)) %>%
-      left_join(geneDGE_filtered$samples),
-    colour = "Genotype", 
-    shape = "Sex", 
-    size = 4
-  ) +
-  theme_bw() +
-  ggtitle("After cqn"), 
-common.legend = TRUE
-)
 ```
 
-# edgeR with cqn
+# Differential expression with RUV covariate. 
 ```{r}
-fit_cqn <- geneDGE_filtered %>% 
-  estimateDisp(design_cqn) %>% 
-  glmFit(design_cqn)
+#Add the W_1 covariate to geneDGEfilt$samples
+geneDGE_filtered$samples %<>% 
+  cbind(RUV$W)
 
-# call the toptable
-topTable_cqn <-
-  glmLRT(fit_cqn, coef = "mut") %>% 
-    topTags(n = Inf) %>% 
-    .$table %>% 
-    mutate(DE = FDR < 0.05, 
-           coef = "W1818*") %>% 
-    dplyr::select(gene_name, logFC, logCPM, PValue, FDR, DE, everything()) %>% 
+# edgeR GLM to determine the effect of RUV --------------------------------
+
+#Design matrix including the W_1 coefficient as a covariate
+designRUV <- model.matrix(~Genotype + W_1,
+                          data = geneDGE_filtered$samples)
+
+#perform the DE test includiing batch effects
+glmRes_batcheffectsremoved <- estimateGLMCommonDisp(geneDGE_filtered, designRUV) %>%
+  estimateGLMTagwiseDisp(designRUV) %>%
+  glmFit(designRUV) %>%
+  glmLRT(coef=2) %>%
+  topTags(n = Inf) %>% 
+  .$table %>% 
+  mutate(DE = FDR < 0.05) %>% 
   as_tibble()
 
-topTable_cqn %>% 
-  head(10) %>% 
-  kable(caption = "DE genes due to sorl1 W1818* after cqn normalisation") %>% 
-  kable_styling()
+head(glmRes_batcheffectsremoved$table) %>% 
+  kable(caption = 'Top 10 DE genes with batch effects removed') %>% 
+  kable_styling(latex_options = 'basic')
 ```
-
-Only 2 DE genes were detected. 
 
 ## visualisation
 
 ```{r}
-topTable_cqn %>% 
+glmRes_batcheffectsremoved %>% 
   ggplot(aes(x = logFC, y = -log10(PValue), colour = DE)) +
   geom_point(alpha = 0.5) +
   theme_bw() +
@@ -469,7 +394,7 @@ topTable_cqn %>%
 ```
 
 ```{r}
-topTable_cqn %>% 
+glmRes_batcheffectsremoved %>% 
   ggplot(aes(x = logCPM, y = logFC, colour = DE)) + 
   geom_point(alpha = 0.5, size = 2) +
   theme(aspect.ratio = 1) +
@@ -481,7 +406,7 @@ topTable_cqn %>%
                      dplyr::filter(DE == T), 
                    show.legend = FALSE)
 
-topTable_cqn %>% 
+glmRes_batcheffectsremoved %>% 
   mutate(rankstat = sign(logFC)*-log10(PValue)) %>% 
   ggplot(aes(x = length, y = rankstat)) +
   geom_point(aes(colour = DE)) +
@@ -496,7 +421,7 @@ topTable_cqn %>%
   geom_hline(yintercept = 0) +
   geom_smooth(se = F)
 
-topTable_cqn %>% 
+glmRes_batcheffectsremoved %>% 
   mutate(rankstat = sign(logFC)*-log10(PValue)) %>% 
   ggplot(aes(x = gc_content, y = rankstat)) +
   geom_point(aes(colour = DE)) +
@@ -511,7 +436,7 @@ topTable_cqn %>%
   geom_smooth(se = F)
 ```
 
-Although `cqn` did not perfectly fix the observed bias, *sorl1* is now detected as a DE gene, which I was expecting since I have shown by qPCR that it is subject to dowregulation due to Nonsesene mediated mRNA decay. Therefore, I will proceed with the analysis. 
+a small 
 
 # Enrichment testing
 
@@ -538,6 +463,12 @@ KEGG <- msigdbr("Danio rerio", category = "C2", subcategory = "CP:KEGG") %>%
 	distinct(gs_name, gene_id, .keep_all = TRUE) %>% 
   split(f = .$gs_name) %>%
   lapply(extract2, "gene_id")
+
+KEGG_sizes <- KEGG %>% 
+  lapply(length) %>% 
+  unlist %>% 
+  as.data.frame() %>% 
+  rownames_to_column("pathway")
 ```
 
 ```{r}
@@ -559,7 +490,7 @@ ireGenes <- readRDS("~/Documents/sorl1_w1818x_6m/ext_data/zebrafishIreGenes.rds"
 ### GSEA
 
 ```{r}
-ranks <- topTable_cqn %>% 
+ranks <- glmRes_batcheffectsremoved %>% 
     mutate(PValue_withsign = sign(logFC) * log10(1/PValue)) %>% 
     arrange(PValue_withsign) %>% 
     dplyr::select(c("gene_id", "PValue_withsign")) %>% #only want the Pvalue with sign
@@ -579,11 +510,11 @@ fgsea_res <- fgsea(stats = ranks, pathways = KEGG, nperm = 1e5) %>%
 
 ### FRY
 ```{r}
-fry_res <- logCPM_cqn %>% 
+fry_res <- RUV$normalizedCounts %>% 
   fry(
       index = KEGG,
-      design = design_cqn, 
-      contrast = "mut", 
+      design = designRUV, 
+      contrast = "Genotypemut", 
       sort = "directional"
     ) %>% 
     rownames_to_column("pathway") %>% 
@@ -593,11 +524,11 @@ fry_res <- logCPM_cqn %>%
 ### camera
 
 ```{r}
-camera_res <- logCPM_cqn %>% 
+camera_res <- RUV$normalizedCounts %>% 
   camera(
     index = KEGG,
-    design = design_cqn,
-    contrast = 'mut', 
+    design = designRUV,
+    contrast = 'Genotypemut', 
     inter.gene.cor = NA,
     sort = TRUE
   ) %>% 
@@ -650,11 +581,11 @@ fgsea_res_hallmark <- fgsea(stats = ranks, pathways = hallmark, nperm = 1e5) %>%
 ```
 ### fry
 ```{r}
-fry_hallmark <- logCPM_cqn %>% 
+fry_hallmark <- RUV$normalizedCounts %>% 
   fry(
       index = hallmark,
-      design = design_cqn, 
-      contrast = "mut", 
+      design = designRUV, 
+      contrast = "Genotypemut", 
       sort = "directional"
     ) %>% 
     rownames_to_column("pathway") %>% 
@@ -662,11 +593,11 @@ fry_hallmark <- logCPM_cqn %>%
 ```
 ## camera
 ```{r}
-camera_hallmark <- logCPM_cqn %>% 
+camera_hallmark <- RUV$normalizedCounts %>% 
   camera(
     index = hallmark,
-    design = design_cqn, 
-    contrast = 'mut', 
+    design = designRUV, 
+    contrast = 'Genotypemut', 
     inter.gene.cor = NA,
     sort = TRUE
   ) %>% 
@@ -716,11 +647,11 @@ fgsea_res_IRE <- fgsea(stats = ranks, pathways = ireGenes, nperm = 1e5) %>%
 ```
 
 ```{r}
-fry_IRE <- logCPM_cqn %>% 
+fry_IRE <- RUV$normalizedCounts %>% 
   fry(
       index = ireGenes,
-      design = design_cqn, 
-      contrast = "mut", 
+      design = designRUV, 
+      contrast = "Genotypemut", 
       sort = "directional"
     ) %>% 
     rownames_to_column("pathway") %>% 
@@ -728,11 +659,11 @@ fry_IRE <- logCPM_cqn %>%
 ```
 
 ```{r}
-camera_IRE <- logCPM_cqn %>% 
+camera_IRE <- RUV$normalizedCounts %>% 
   camera(
     index = ireGenes,
-    design = design_cqn, 
-    contrast = 'mut', 
+    design = designRUV, 
+    contrast = 'Genotypemut', 
     inter.gene.cor = NA,
     sort = TRUE
   ) %>% 
@@ -769,7 +700,65 @@ harmonic_p_IRE <- fry_IRE %>%
   arrange(harmonic_p_FDR) 
 ```
 
+# Vis
 
+```{r}
+harmonic_p_hallmark %>% 
+  bind_rows(harmonic_p_IRE) %>% 
+  bind_rows(harmonic_p_KEGG) %>% 
+  arrange(harmonic_p_FDR) %>% 
+  dplyr::filter(harmonic_p_FDR < 0.1) %>% 
+  ggplot(aes(x = -log10(harmonic_p), y = pathway)) + 
+  geom_col(aes(fill = sig)) +
+  geom_vline(xintercept = 3) +
+  theme_bw()
 
+glmRes_batcheffectsremoved %>% 
+  dplyr::filter(gene_id %in% KEGG$KEGG_RIBOSOME) %>% 
+  dplyr::select(gene_name, logFC) %>% 
+  column_to_rownames("gene_name") %>% 
+  pheatmap(cluster_cols = F, 
+           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+           )
 
+glmRes_batcheffectsremoved %>% 
+  dplyr::filter(gene_id %in% KEGG$KEGG_OXIDATIVE_PHOSPHORYLATION) %>% 
+  dplyr::select(gene_name, logFC) %>% 
+  column_to_rownames("gene_name") %>% 
+  pheatmap(cluster_cols = F, 
+           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+           )
+
+glmRes_batcheffectsremoved %>% 
+  dplyr::filter(gene_id %in% KEGG$KEGG_GLYCOLYSIS_GLUCONEOGENESIS) %>% 
+  dplyr::select(gene_name, logFC) %>% 
+  column_to_rownames("gene_name") %>% 
+  pheatmap(cluster_cols = F, 
+           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+           )
+
+glmRes_batcheffectsremoved %>% 
+  dplyr::filter(gene_id %in% KEGG$KEGG_HUNTINGTONS_DISEASE) %>% 
+  dplyr::select(gene_name, logFC) %>% 
+  column_to_rownames("gene_name") %>% 
+  pheatmap(cluster_cols = F, 
+           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+           )
+
+glmRes_batcheffectsremoved %>% 
+  dplyr::filter(gene_id %in% KEGG$KEGG_PARKINSONS_DISEASE) %>% 
+  dplyr::select(gene_name, logFC) %>% 
+  column_to_rownames("gene_name") %>% 
+  pheatmap(cluster_cols = F, 
+           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+           )
+
+glmRes_batcheffectsremoved %>% 
+  dplyr::filter(gene_id %in% KEGG$KEGG_PYRUVATE_METABOLISM) %>% 
+  dplyr::select(gene_name, logFC) %>% 
+  column_to_rownames("gene_name") %>% 
+  pheatmap(cluster_cols = F, 
+           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+           )
+```
 
