@@ -78,7 +78,6 @@ metadata %>%
   dplyr::select(-c(SampleName, Full_sample_Info, short_sample_name)) %>% 
   kable(caption = "Summary of fish metadata") %>% 
   kable_styling(latex_options = 'basic', full_width = F)
-
 ```
 ## annotations
 
@@ -140,6 +139,10 @@ counts <- list.files(
 colnames(counts$counts) <- colnames(counts$counts) %>%
   basename() %>%
   str_replace_all("(.+)Unmapped.out.mate1.fq", "samp_\\1")
+
+# write out counts for GEO
+counts$counts %>% 
+  write.csv("transcriptCounts.csv")
 ```
 
 ## make DGE
@@ -353,6 +356,7 @@ RUV$normalizedCounts %>%
 ```
 
 # Differential expression with RUV covariate. 
+
 ```{r}
 #Add the W_1 covariate to geneDGEfilt$samples
 geneDGE_filtered$samples %<>% 
@@ -374,9 +378,14 @@ glmRes_batcheffectsremoved <- estimateGLMCommonDisp(geneDGE_filtered, designRUV)
   mutate(DE = FDR < 0.05) %>% 
   as_tibble()
 
-head(glmRes_batcheffectsremoved$table) %>% 
+head(glmRes_batcheffectsremoved) %>% 
   kable(caption = 'Top 10 DE genes with batch effects removed') %>% 
   kable_styling(latex_options = 'basic')
+
+# write out results for paper
+# glmRes_batcheffectsremoved %>% 
+#   dplyr::select(gene_id, gene_name, logFC, logCPM, LR, PValue, FDR, everything()) %>% 
+#   write_csv("DGE_results_RUV.csv")
 ```
 
 ## visualisation
@@ -708,10 +717,14 @@ harmonic_p_hallmark %>%
   bind_rows(harmonic_p_KEGG) %>% 
   arrange(harmonic_p_FDR) %>% 
   dplyr::filter(harmonic_p_FDR < 0.1) %>% 
+  left_join(fry_hallmark %>% 
+              bind_rows(fry_res) %>% 
+              dplyr::select(pathway, Direction, NGenes)) %>% 
   ggplot(aes(x = -log10(harmonic_p), y = pathway)) + 
-  geom_col(aes(fill = sig)) +
+  geom_col(aes(fill = Direction)) +
   geom_vline(xintercept = 3) +
-  theme_bw()
+  theme_bw() +
+  scale_fill_manual(values = c(brewer.pal(n = 5, name = "RdBu")[c(5,1)]))
 
 glmRes_batcheffectsremoved %>% 
   dplyr::filter(gene_id %in% KEGG$KEGG_RIBOSOME) %>% 
@@ -761,4 +774,477 @@ glmRes_batcheffectsremoved %>%
            color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
            )
 ```
+
+## Plots for Pub
+
+### Figure 2
+```{r}
+ggarrange(
+  RUV$normalizedCounts %>% 
+    cpm(log=TRUE) %>% 
+    t() %>% 
+    prcomp() %>% 
+    autoplot(
+      data = tibble(short_sample_name = rownames(.$x)) %>%
+        left_join(geneDGE_filtered$samples %>% 
+                    mutate(Genotype_for_pub = case_when(
+                      Genotype == "mut" ~ "W1818*/+", 
+                      Genotype == "WT" ~ "+/+"))),
+      colour = "Genotype_for_pub", 
+      shape = "Sex", 
+      size = 4
+    ) +
+    theme_bw() +
+    scale_color_manual(values = c("#0380fc", "#fc9d03")) +
+    labs(colour = "Genotype") +
+    theme(legend.position = "bottom"),
+  ggarrange(
+  glmRes_batcheffectsremoved %>% 
+    ggplot(aes(x = logFC, y = -log10(PValue), colour = DE)) +
+    geom_point(alpha = 0.5) +
+    theme_bw() +
+    geom_label_repel(aes(label = gene_name), 
+                     data = . %>% dplyr::filter(DE == T), 
+                     show.legend = F) +
+    scale_color_manual(values = c("grey50", "red")) +
+    labs(colour = "Differential expression?") +
+    theme(legend.position = "bottom") ,
+  
+  glmRes_batcheffectsremoved %>% 
+    ggplot(aes(x = logCPM, y = logFC, colour = DE)) + 
+    geom_point(alpha = 0.5, size = 2) +
+    theme_bw() +
+    scale_color_manual(values = c("grey50", "red")) +
+    geom_label_repel(aes(label = gene_name), 
+                     data = . %>% 
+                       dplyr::filter(DE == T), 
+                     show.legend = FALSE) +
+    labs(colour = "Differential expression?", 
+         x = "Average expression (logCPM)") +
+    theme( 
+      legend.position = "none") ,
+  common.legend = TRUE, 
+  labels = c("B", "C"), 
+  legend = "bottom"
+  ),
+  labels = c("A", " "), 
+  widths = c(1, 2),
+  common.legend = FALSE,
+  nrow = 1) +
+  ggsave("plots/Figure2.pdf", width = 20, height = 9, units = "cm", scale = 1.2, dpi = 600)
+```
+
+# Figure 3:
+## harmonic p vals 
+```{r}
+harmonic_p_hallmark %>% 
+  bind_rows(harmonic_p_IRE) %>% 
+  bind_rows(harmonic_p_KEGG) %>% 
+  arrange(harmonic_p_FDR) %>% 
+  dplyr::filter(harmonic_p_FDR < 0.1) %>% 
+  left_join(fry_hallmark %>% 
+              bind_rows(fry_res) %>% 
+              dplyr::select(pathway, Direction, NGenes)) %>% 
+  ggplot(aes(x = -log10(harmonic_p), y = pathway)) + 
+  geom_col(aes(fill = Direction, alpha = sig)) +
+  scale_alpha_manual(values = c(0.5, 1)) +
+  geom_vline(xintercept = 3) +
+  theme_bw() +
+  scale_fill_manual(values = c(brewer.pal(n = 5, name = "RdBu")[c(5,1)])) +
+  ggsave("plots/harmonicP.pdf", width = 10, height = 7, units = "cm", dpi = 600, scale = 1.5)
+```
+
+### upset
+```{r}
+tiff("plots/Upset.tiff", width = 19, height = 10, units = "cm", res = 600, pointsize = 0.001, )
+ fgsea_res %>% 
+  bind_rows(fgsea_res_hallmark) %>% 
+  bind_rows(fgsea_res_IRE) %>% 
+  dplyr::filter(pathway %in% c(harmonic_p_hallmark %>% 
+                  bind_rows(harmonic_p_KEGG) %>% 
+                    bind_rows(harmonic_p_IRE) %>% 
+                    dplyr::filter(harmonic_p_FDR < 0.05) %>% 
+                    .$pathway)
+                  ) %>% 
+  dplyr::select(pathway, leadingEdge) %>% 
+  unnest %>% 
+  split(f = .$pathway) %>% 
+  lapply(magrittr::extract2,"leadingEdge") %>% 
+  fromList() %>% 
+  upset(order.by = "freq", 
+        nintersects = NA, 
+        nsets = 6, 
+        sets.x.label = "Number of genes\nin leading edge",
+        set_size.numbers_size = 6
+  )
+dev.off()
+```
+
+# leading edge shared genes pheatmap/
+```{r}
+tiff("plots/LeadingEdgePheatmap.tiff", width = 24, height = 10, units = "cm", res = 0.1)
+fgsea_res %>% 
+  bind_rows(fgsea_res_hallmark) %>% 
+  dplyr::filter(pathway %in% c("KEGG_PARKINSONS_DISEASE", "KEGG_OXIDATIVE_PHOSPHORYLATION", "HALLMARK_OXIDATIVE_PHOSPHORYLATION", "KEGG_HUNTINGTONS_DISEASE")) %>% 
+  dplyr::select(pathway, leadingEdge) %>% 
+  unnest %>% 
+  as_tibble() %>% 
+  set_colnames(c("pathway", "gene_id")) %>% 
+  left_join(glmRes_batcheffectsremoved) %>% 
+  dplyr::select(gene_name, pathway, logFC) %>% 
+  spread(key = "pathway", value = "logFC") %>% 
+  column_to_rownames("gene_name") %>% 
+  t() %>% 
+  pheatmap( 
+    na_col = "white", 
+    cluster_cols= F, 
+    fontsize = 10,
+   # cellwidth = 10,
+    cluster_rows = F, 
+    color = colorRampPalette(colors = c("darkblue", "lightblue"))(100))
+dev.off()
+```
+
+## heatmaps
+```{r}
+tiff("plots/oxphosPheatmap.tiff", width =500, height = 1300, units = "px", res = 600)
+glmRes_batcheffectsremoved %>% 
+  dplyr::filter(gene_id %in% KEGG$KEGG_OXIDATIVE_PHOSPHORYLATION) %>% 
+  dplyr::select(gene_name, logFC) %>% 
+  column_to_rownames("gene_name") %>% 
+  pheatmap(cluster_cols = F,
+           treeheight_row = 0, treeheight_col = 0,
+           border_color = NA,
+           breaks = c(seq(min(.), 
+                          0, 
+                          length.out=ceiling(100/2)), 
+                      seq(max(.)/100, 
+                          max(.), 
+                          length.out=floor(100/2))),
+           color = colorRampPalette(rev(brewer.pal(n = 7, "RdBu")))(100), 
+           height = 10, 
+           cellwidth = 15,
+           show_colnames = F, show_rownames = F
+           )
+dev.off()
+```
+
+### KEGG Parkinsons
+```{r}
+tiff("plots/KEGG_PARKINSONS_DISEASE_Pheatmap.tiff",width = 600, height = 1300, units = "px", res = 600)
+glmRes_batcheffectsremoved %>% 
+  dplyr::filter(gene_id %in% KEGG$KEGG_PARKINSONS_DISEASE) %>% 
+  dplyr::select(gene_name, logFC) %>% 
+  column_to_rownames("gene_name") %>% 
+  pheatmap(cluster_cols = F,
+           treeheight_row = 0, treeheight_col = 0,
+           border_color = NA,
+           breaks = c(seq(min(.), 
+                          0, 
+                          length.out=ceiling(100/2)), 
+                      seq(max(.)/100, 
+                          max(.), 
+                          length.out=floor(100/2))),
+           color = colorRampPalette(rev(brewer.pal(n = 7, "RdBu")))(100), 
+           height = 10, 
+           annotation_row = glmRes_batcheffectsremoved %>%
+             dplyr::filter(gene_id %in% KEGG$KEGG_PARKINSONS_DISEASE) %>%
+             dplyr::select(gene_name, gene_id) %>%
+             mutate(in_leading_edge = case_when(
+               gene_id %in% c(fgsea_res %>%
+                                dplyr::filter(pathway == "KEGG_PARKINSONS_DISEASE") %>% .$leadingEdge %>% .[[1]]) ~ TRUE,
+               TRUE ~ FALSE)) %>%
+             dplyr::select(gene_name, in_leading_edge) %>%
+             mutate(in_leading_edge = as.character(in_leading_edge)) %>% 
+             column_to_rownames("gene_name"), annotation_legend = FALSE, annotation_names_row = FALSE,
+           cellwidth = 15,
+           annotation_colors = list(in_leading_edge = c("FALSE" = NA, "TRUE" = "grey30")),
+           show_colnames = F, show_rownames = F
+           )
+dev.off()
+```
+
+### KEGG Huntingtons
+```{r}
+tiff("plots/KEGG_HUNTINGTONS_DISEASE_Pheatmap.tiff", width = 500, height = 1300, units = "px", res = 600)
+glmRes_batcheffectsremoved %>% 
+  dplyr::filter(gene_id %in% KEGG$KEGG_HUNTINGTONS_DISEASE) %>% 
+  dplyr::select(gene_name, logFC) %>% 
+  column_to_rownames("gene_name") %>% 
+pheatmap(cluster_cols = F,
+           treeheight_row = 0, treeheight_col = 0,
+           border_color = NA,
+           breaks = c(seq(min(.), 
+                          0, 
+                          length.out=ceiling(100/2)), 
+                      seq(max(.)/100, 
+                          max(.), 
+                          length.out=floor(100/2))),
+           color = colorRampPalette(rev(brewer.pal(n = 7, "RdBu")))(100), 
+           height = 10, 
+           cellwidth = 15,
+           show_colnames = F, show_rownames = F
+           )
+dev.off()
+```
+
+### RIBOSOME
+
+```{r}
+tiff("plots/KEGG_RIBO_Pheatmap.tiff", width = 500, height = 1300, units = "px", res = 600)
+glmRes_batcheffectsremoved %>% 
+  dplyr::filter(gene_id %in% KEGG$KEGG_RIBOSOME) %>% 
+  dplyr::select(gene_name, logFC) %>% 
+  column_to_rownames("gene_name") %>% 
+ pheatmap(cluster_cols = F,
+           treeheight_row = 0, treeheight_col = 0,
+           border_color = NA,
+           breaks = c(seq(min(.), 
+                          0, 
+                          length.out=ceiling(100/2)), 
+                      seq(max(.)/100, 
+                          max(.), 
+                          length.out=floor(100/2))),
+           color = colorRampPalette(rev(brewer.pal(n = 7, "RdBu")))(100), 
+           height = 10, 
+           cellwidth = 15,
+           show_colnames = F, show_rownames = F
+           )
+dev.off()
+```
+
+### GLYCOLYSIS
+```{r}
+tiff("plots/KEGG_GLYCO_Pheatmap.tiff", width = 500, height = 1300, units = "px", res = 600)
+glmRes_batcheffectsremoved %>% 
+  dplyr::filter(gene_id %in% KEGG$KEGG_GLYCOLYSIS_GLUCONEOGENESIS) %>% 
+  dplyr::select(gene_name, logFC) %>% 
+  column_to_rownames("gene_name") %>% 
+ pheatmap(cluster_cols = F,
+           treeheight_row = 0, treeheight_col = 0,
+           border_color = NA,
+           breaks = c(seq(min(.), 
+                          0, 
+                          length.out=ceiling(100/2)), 
+                      seq(max(.)/100, 
+                          max(.), 
+                          length.out=floor(100/2))),
+           color = colorRampPalette(rev(brewer.pal(n = 7, "RdBu")))(100), 
+           height = 10, 
+           cellwidth = 15,
+           show_colnames = F, show_rownames = F
+           )
+dev.off()
+```
+## pathviews
+```{r}
+sigPaths <-harmonic_p_hallmark %>% 
+  bind_rows(harmonic_p_KEGG) %>% 
+  bind_rows(harmonic_p_IRE) %>% 
+  dplyr::filter(harmonic_p_FDR < 0.05) %>% 
+  .$pathway 
+```
+
+### oxphos
+```{r}
+pathview(
+  species = "dre", 
+  pathway.id = "dre00190", 
+  gene.data = glmRes_batcheffectsremoved %>% 
+    dplyr::select(gene_id, logFC) %>% 
+    column_to_rownames("gene_id"), 
+  gene.idtype = "ENSEMBL", 
+  limit = list(gene = 0.3, 
+               cpd = 0.3), 
+  low = list(gene = "#2166AC", 
+             cpd = "white"),
+  high = list(gene = "#B2182B", 
+              cpd = "white"),
+  bins = list(gene = 20, 
+              cpd = 20), 
+  out.suffix = "_oxphos"
+         )
+```
+
+## cell type check
+```{r}
+cell_type_markers <- readRDS("ext_data/cell_type_markers.rds")
+
+temp <- cell_type_markers %>% 
+  unlist() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("cell_type") %>% 
+  set_colnames(c("cell_type", "gene_id")) %>% 
+  mutate(cell_type = cell_type %>% str_remove_all(pattern = "[0-9]+")) %>% 
+  left_join(geneDGE_filtered$counts %>% 
+              cpm(log = TRUE) %>% 
+              as.data.frame() %>% 
+              rownames_to_column("gene_id")) %>% 
+  na.omit %>% 
+  gather(key = "short_sample_name", value = "logCPM", 
+         starts_with("samp")) %>% 
+  left_join(geneDGE_filtered$samples) %>% 
+  mutate(Genotype = case_when(
+    Genotype == "mut" ~ "W1818*/+", 
+    Genotype == "WT" ~ "+/+"
+  )) %>% 
+  ggplot(aes(x = Genotype, y = logCPM)) +
+  geom_boxplot(aes(fill = Genotype)) +
+  theme_bw() +
+  facet_wrap(~cell_type) +
+  scale_fill_manual(values = c("#00aaff", "#ff9d00"))  +
+  theme(legend.position = "bottom") +
+  ggsave("plots/celltypecheck.png", width = 6, height = 7, units = "cm", dpi = 600, scale = 1.5)
+
+saveRDS(temp, "~/Box Sync/cellType.rds")
+
+```
+
+# Promotor analysis on the most DE genes using `homer`
+
+`homer` was run using the [findMotifs.pl](http://homer.ucsd.edu/homer/motif/index.html) method to obtain the enriched known zebrafish promoter motifs and functional enrichment. Note that the background set of genes used when running `homer` is the `r dim(geneDGE_filtered)[1]` i.e. the number of genes detected in this RNA-seq experiment. 
+
+The input genes at this stage will be the top 100 most DE genes in the RNAseq experiment. If I do not find anything, then I will increase this number a little. 
+
+```{r}
+# output the background genes:
+rownames(geneDGE_filtered) %>% 
+  as.data.frame() %>% 
+  write_tsv("~/homer/backgroundGenes.txt")
+
+# Get the top 100 most DE genes
+glmRes_batcheffectsremoved[1:100,1] %>% 
+  as.data.frame() %>% 
+  write_tsv("~/homer/top100DEgenes.txt")
+
+```
+
+This is the command i used to generate the `homer` results:
+
+`findMotifs.pl top100DEgenes.txt zebrafish res/ -start -1500 -end 200  -bg backgroundGenes.txt`
+
+The results of the `homer` analysis was saved in the folder `/res`. The table below summarises the results. No significant motifs were found to be over-represented in the top 61 most DE genes. Note that I input 100 genes, but only 61 were recognised by `homer`. 
+
+```{r}
+read_tsv("~/homer/res/knownResults.txt") %>% 
+  mutate(FDR = p.adjust(`P-value`, "fdr")) %>% 
+  dplyr::select(`Motif Name`, Consensus, `P-value`, FDR, everything()) %>%
+  head(5) %>% 
+  kable(caption = "top 5 most significant promotor motifs enrichned in the top 100 most De genes according to homer") %>% 
+  kable_styling()
+```
+
+
+
+```{r}
+glmRes_batcheffectsremoved[1:200,1] %>% 
+  as.data.frame() %>% 
+  write_tsv("~/homer/top200DEgenes.txt")
+
+read_tsv("~/homer/res2/knownResults.txt") %>% 
+  mutate(bonf = p.adjust(`P-value`, "bonferroni")) %>% 
+  dplyr::select(`Motif Name`, Consensus, `P-value`, bonf, everything()) %>%
+  head(5) %>% 
+  write.csv("homerRes.csv")
+  kable(caption = "top 5 most significant promotor motifs enrichned in the top 100 most De genes according to homer") %>% 
+  kable_styling()
+  
+  # expression of hnf4a
+geneDGE %>% 
+  cpm(log = T) %>% 
+  as.data.frame() %>% 
+  .["ENSDARG00000021494",] %>% 
+  melt() %>% 
+  set_colnames(c("short_sample_name", "logCPM")) %>% 
+  left_join(geneDGE_filtered$samples) %>% 
+  mutate(Genotype = dplyr::recode(Genotype, mut = "W1818*/+")) %>% 
+  mutate(Genotype = dplyr::recode(Genotype, WT = "+/+")) %>% 
+  ggplot(aes(x = Genotype, y = logCPM)) + 
+  geom_boxplot(outlier.shape = NA, 
+               aes(fill = Genotype)) +
+  geom_jitter(aes(shape = Sex), 
+              size = 4) +
+  scale_fill_manual(values = c("#0380fc", "#fc9d03")) +
+  theme_bw() +
+  easy_rotate_x_labels(angle = 45, side = "right") +
+  ggsave("plots/hnf_logCPM.png", width = 7, height = 7, units = "cm", dpi = 600, scale = 1.5)
+
+ msigdbr("Danio rerio", category = "C3", subcategory = "TFT:TFT_Legacy") %>% 
+   dplyr::filter(gs_name == "HNF4ALPHA_Q6") %>% 
+	inner_join(ens2Entrez) %>%
+	distinct(gs_name, gene_id, .keep_all = TRUE) %>% 
+  dplyr::select(gene_id) %>% 
+  left_join(glmRes_batcheffectsremoved) %>% 
+   dplyr::select(gene_name, logFC)  %>% 
+   column_to_rownames("gene_name") %>% 
+   pheatmap(cluster_cols = F, 
+            breaks = c(seq(min(.), # set 0 as white
+                           0, 
+                           length.out=ceiling(100/2)), 
+                       seq(max(.)/100, 
+                           max(.), 
+                           length.out=floor(100/2))),
+            color = colorRampPalette(rev(brewer.pal(n = 7, "RdBu")))(100), 
+            treeheight_row = 0, cellwidth = 10)
+ 
+ 
+msigdbr("Danio rerio", category = "C3", subcategory = "TFT:TFT_Legacy") %>% 
+   dplyr::filter(gs_name == "HNF4ALPHA_Q6") %>% 
+	inner_join(ens2Entrez) %>%
+	distinct(gs_name, gene_id, .keep_all = TRUE) %>% 
+  dplyr::select(gene_id) %>% 
+  left_join(glmRes_batcheffectsremoved) %>% 
+   dplyr::select(gene_name, logFC) %>% 
+  mutate(temp = case_when(logFC > 0.5 ~ "up", 
+    logFC < -0.5 ~ "down", 
+    TRUE ~ "logFC ~ 0") %>% as.factor()) %>% 
+  ggplot(aes(x = temp)) +
+  geom_bar(aes(fill = temp), position = "stack") +
+  theme_bw()
+
+RUV$normalizedCounts %>% 
+  .[c(msigdbr("Danio rerio", category = "C3", subcategory = "TFT:TFT_Legacy") %>% 
+   dplyr::filter(gs_name == "HNF4ALPHA_Q6") %>% 
+	inner_join(ens2Entrez) %>%
+	distinct(gs_name, gene_id, .keep_all = TRUE) %>% .$gene_id),] %>% 
+  t() %>% 
+  prcomp() %>% 
+  autoplot( data = tibble(short_sample_name = rownames(.$x)) %>%
+      left_join(geneDGE_filtered$samples),
+    colour = "Genotype", 
+    shape = "Sex", 
+    size = 4
+  ) +
+  scale_colour_manual(values = c("#0380fc", "#fc9d03")) +
+  theme_bw() +
+  ggsave("plots/hnf_PCA.png", width = 7, height = 7, units = "cm", dpi = 600, scale = 1.5)
+
+```
+
+## check for GC and length bias
+
+A small bias for GC is observed, but i think it is nothing too bad. It seems at its worst at the extremes, where low number of genes have this. 
+
+```{r}
+glmRes_batcheffectsremoved %>% 
+  mutate(rankstat = sign(logFC)*-log10(PValue)) %>% 
+  ggplot(aes(x = length, y = rankstat)) +
+  geom_point(aes(colour = DE), 
+             alpha = 0.5) +
+  scale_color_manual(values = c("grey50", "red")) +
+  geom_smooth(se = F) +
+  theme_bw() +
+  scale_x_log10()
+
+glmRes_batcheffectsremoved %>% 
+  mutate(rankstat = sign(logFC)*-log10(PValue)) %>% 
+  ggplot(aes(x = gc_content, y = rankstat)) +
+  geom_point(aes(colour = DE), 
+             alpha = 0.5) +
+  scale_color_manual(values = c("grey50", "red")) +
+  geom_hline(yintercept = 0) +
+  geom_smooth(se = F) +
+  theme_bw()
+```
+
 
